@@ -1,0 +1,23 @@
+# Background Subtraction Application Configuration
+
+# HTTP Streamer Settings
+http_streamer:
+  url: "http://192.168.1.100:8080/video_feed"  # Replace with your HTTP camera URL
+  timeout: 5  # Connection timeout in seconds
+
+# Background Image Paths (fallbacks if no image loaded via UI)
+# - path: generic default (also used for uploaded mode)
+# - realsense_path: fallback when running in RealSense mode
+# - http_path: fallback when running in Top Camera (HTTP) mode
+background_image:
+  path: "./captures/default_background.png"          # Default / uploaded mode fallback
+  realsense_path: "./captures/realsense_background.png"  # RealSense mode fallback
+  http_path: "./captures/http_background.png"            # Top Camera (HTTP) mode fallback
+
+
+# Processing Parameters (defaults)
+processing:
+  min_deviation: 80
+  max_deviation: 255
+  min_contour_area: 1000
+
