@@ -92,10 +92,11 @@ class RealSenseStreamer:
 class HttpStreamer:
     """Handle HTTP/IP Camera streaming (RGB only) using OpenCV"""
     
-    def __init__(self, url: str = "http://192.168.1.100:8080/video", timeout: int = 5):
+    def __init__(self, url: str = "http://192.168.1.100:8080/video", timeout: int = 5, pixel_to_mm: float = 1.0):
         # Default URL placeholder - user might need to change this or we can add input in UI later
         self.url = url
         self.timeout = timeout
+        self.pixel_to_mm = pixel_to_mm
         self.cap = None
         self.is_running = False
         self.stop_flag = False
@@ -154,3 +155,23 @@ class HttpStreamer:
             logger.info("HTTP stream stopped")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
+
+    def compute_diameter_mm(self, mask: np.ndarray):
+        """Compute diameter (pixels and mm) of largest contour in a binary mask.
+        Returns tuple (diameter_px, diameter_mm) or (None, None) if not found."""
+        if mask is None or mask.size == 0:
+            return None, None
+
+        try:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None, None
+
+            main_contour = max(contours, key=cv2.contourArea)
+            (x, y), radius = cv2.minEnclosingCircle(main_contour)
+            diameter_px = 2.0 * radius
+            diameter_mm = diameter_px * float(self.pixel_to_mm)
+            return diameter_px, diameter_mm
+        except Exception as e:
+            logger.error(f"Diameter computation error: {e}")
+            return None, None

@@ -4,6 +4,7 @@
 http_streamer:
   url: "http://192.168.1.100:8080/video_feed"  # Replace with your HTTP camera URL
   timeout: 5  # Connection timeout in seconds
+  pixel_to_mm: 0.5  # Multiplier to convert measured pixels to millimeters (tune per calibration)
 
 # Background Image Paths (fallbacks if no image loaded via UI)
 # - path: generic default (also used for uploaded mode)

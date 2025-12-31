@@ -146,7 +146,9 @@ class BackgroundSubtractionApp(QMainWindow):
         bg_group = QGroupBox("Background Image (Shared)")
         bg_layout = QHBoxLayout()
         self.btn_load_bg = QPushButton("Load Background Image")
+        self.btn_capture_bg = QPushButton("Capture Background")
         bg_layout.addWidget(self.btn_load_bg)
+        bg_layout.addWidget(self.btn_capture_bg)
         bg_layout.addStretch()
         bg_group.setLayout(bg_layout)
         
@@ -303,6 +305,7 @@ class BackgroundSubtractionApp(QMainWindow):
         self.radio_top_cam.toggled.connect(self.on_mode_changed)
         
         self.btn_load_bg.clicked.connect(self.load_background)
+        self.btn_capture_bg.clicked.connect(self.capture_background)
         self.btn_load_target.clicked.connect(self.load_target)
         
         self.btn_start_camera.clicked.connect(self.start_camera)
@@ -388,6 +391,22 @@ class BackgroundSubtractionApp(QMainWindow):
             else:
                 QMessageBox.warning(self, "Error", "Failed to load image")
 
+    def capture_background(self):
+        """Capture current frame as background (for RealSense or HTTP modes)"""
+        if self.current_color_frame is None:
+            QMessageBox.warning(self, "Capture", "No camera frame available. Start camera first.")
+            return
+
+        self.background_image = self.current_color_frame.copy()
+
+        self.lbl_background.setPixmap(
+            ndarray_to_qpixmap(self.background_image, is_bgr=True).scaled(
+                self.lbl_background.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
+
+        self.lbl_status.setText("Background captured from camera")
+
     def start_camera(self):
         """Start the appropriate camera based on current mode"""
         if self.streamer and self.streamer.is_running:
@@ -402,8 +421,9 @@ class BackgroundSubtractionApp(QMainWindow):
                 http_config = self.config.get('http_streamer', {})
                 http_url = http_config.get('url', "http://192.168.1.100:8080/video_feed")
                 http_timeout = http_config.get('timeout', 5)
+                http_pixel_to_mm = http_config.get('pixel_to_mm', 1.0)
                 
-                self.streamer = HttpStreamer(url=http_url, timeout=http_timeout)
+                self.streamer = HttpStreamer(url=http_url, timeout=http_timeout, pixel_to_mm=http_pixel_to_mm)
                 logger.info(f"Initialized HTTP streamer with URL: {http_url}")
             else:
                  QMessageBox.warning(self, "Mode Error", "Please select RealSense or Top Camera mode first")
@@ -713,6 +733,11 @@ class BackgroundSubtractionApp(QMainWindow):
                 depth_frame = None
                 logger.info("Top camera mode: No depth frame available")
 
+                # Compute diameter in mm for top camera using streamer helper
+                diameter_px, diameter_mm = (None, None)
+                if isinstance(self.streamer, HttpStreamer):
+                    diameter_px, diameter_mm = self.streamer.compute_diameter_mm(filtered_mask)
+
             
             wheel_info = self.find_wheel_center_and_depth(filtered_mask, depth_frame)
             self.wheel_center_info = wheel_info
@@ -759,6 +784,8 @@ class BackgroundSubtractionApp(QMainWindow):
                  info_lines.append("Depth: Not available (Top Camera mode)")
             elif wheel_info['depth_mm'] is None and self.current_mode == "uploaded":
                 info_lines.append("Depth: Not available (uploaded image mode)")
+            if self.current_mode == "top_camera" and diameter_mm is not None:
+                info_lines.append(f"Detected diameter: {diameter_px:.1f} px ≈ {diameter_mm:.1f} mm")
             if wheel_info['error'] and wheel_info['error'] != "Depth frame not available":
                  # Only show error if it's not the expected missing depth
                 info_lines.append(f"Note: {wheel_info['error']}")
