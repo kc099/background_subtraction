@@ -89,6 +89,84 @@ class RealSenseStreamer:
             logger.error(f"Cleanup error: {e}")
 
 
+class DepthProcessor:
+    """Handle depth-based 3D measurements"""
+    
+    def __init__(self, intrinsics: dict, depth_scale: float = 0.001):
+        """Initialize depth processor
+        
+        Args:
+            intrinsics: Camera intrinsic parameters (dict with fx, fy, cx, cy, width, height)
+            depth_scale: Depth scale factor (mm per unit)
+        """
+        self.intrinsics = intrinsics
+        self.depth_scale = depth_scale
+    
+    def deproject_pixel_to_3d(self, x: float, y: float, depth: float) -> tuple:
+        """Convert 2D pixel to 3D world coordinates using depth
+        
+        Args:
+            x: Pixel x coordinate
+            y: Pixel y coordinate
+            depth: Depth value in raw units
+            
+        Returns:
+            3D point (x, y, z) in millimeters
+        """
+        try:
+            # Create intrinsics object for pyrealsense2
+            intr = rs.intrinsics()
+            intr.fx = self.intrinsics['fx']
+            intr.fy = self.intrinsics['fy']
+            intr.ppx = self.intrinsics['cx']
+            intr.ppy = self.intrinsics['cy']
+            intr.width = self.intrinsics['width']
+            intr.height = self.intrinsics['height']
+            intr.model = rs.distortion.none
+            intr.coeffs = [0, 0, 0, 0, 0]
+            
+            # Deproject pixel to 3D (RealSense expects depth in meters)
+            # depth is in raw units, depth_scale converts to meters
+            depth_m = depth * self.depth_scale
+            point_3d = rs.rs2_deproject_pixel_to_point(intr, [x, y], depth_m)
+            
+            # rs2_deproject_pixel_to_point returns coordinates in meters, convert to mm
+            return (point_3d[0] * 1000, point_3d[1] * 1000, point_3d[2] * 1000)
+        
+        except Exception as e:
+            logger.error(f"Error deprojecting pixel: {e}")
+            return (0, 0, 0)
+    
+    def get_depth_at_point(self, x: int, y: int, depth_frame: np.ndarray, 
+                          window_size: int = 15) -> float:
+        """Get valid depth value in a window around specified point
+        
+        Args:
+            x: Pixel x coordinate
+            y: Pixel y coordinate
+            depth_frame: Depth image array
+            window_size: Size of window for averaging
+            
+        Returns:
+            Depth value in raw units
+        """
+        h, w = depth_frame.shape
+        x = np.clip(x, 0, w - 1)
+        y = np.clip(y, 0, h - 1)
+        
+        half_window = window_size // 2
+        x_start = max(x - half_window, 0)
+        x_end = min(x + half_window + 1, w)
+        y_start = max(y - half_window, 0)
+        y_end = min(y + half_window + 1, h)
+        
+        window = depth_frame[y_start:y_end, x_start:x_end]
+        valid_depths = window[(window > 0) & (window < 65535)]
+        
+        if len(valid_depths) > 0:
+            return float(np.median(valid_depths))
+        return 0.0
+
 class HttpStreamer:
     """Handle HTTP/IP Camera streaming (RGB only) using OpenCV"""
     

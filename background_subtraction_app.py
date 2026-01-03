@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 # Import custom classes
-from realsense_streamer import RealSenseStreamer, HttpStreamer
+from realsense_streamer import RealSenseStreamer, HttpStreamer, DepthProcessor
 from background_subtraction import BackgroundSubtraction, get_background_from_config
 
 logging.basicConfig(level=logging.INFO)
@@ -173,9 +173,12 @@ class BackgroundSubtractionApp(QMainWindow):
         # Process button
         process_layout = QHBoxLayout()
         self.btn_process = QPushButton("Run Background Subtraction")
+        self.btn_detect_rim = QPushButton("Detect Rim")
         self.btn_process.setStyleSheet("font-size: 14px; padding: 10px; background-color: #4CAF50; color: white;")
+        self.btn_detect_rim.setStyleSheet("font-size: 14px; padding: 10px; background-color: #2196F3; color: white;")
         
         process_layout.addWidget(self.btn_process)
+        process_layout.addWidget(self.btn_detect_rim)
         process_layout.addStretch()
         
         # Parameters
@@ -274,14 +277,6 @@ class BackgroundSubtractionApp(QMainWindow):
         results_layout.addWidget(mask_group)
         results_layout.addWidget(overlay_group)
         
-        # Wheel center and depth info
-        center_group = QGroupBox("Wheel Center & Depth")
-        center_layout = QVBoxLayout()
-        self.lbl_wheel_info = QLabel("Process images to detect wheel center")
-        self.lbl_wheel_info.setStyleSheet("font-size: 13px; padding: 10px; background:#2a2a2a; color:#0f0;")
-        self.lbl_wheel_info.setWordWrap(True)
-        center_layout.addWidget(self.lbl_wheel_info)
-        center_group.setLayout(center_layout)
         
         # Status info
         self.lbl_status = QLabel("Ready. Load background image first (shared for both modes), then load or capture target.")
@@ -294,7 +289,6 @@ class BackgroundSubtractionApp(QMainWindow):
         main_layout.addWidget(params_group)
         main_layout.addLayout(display_layout)
         main_layout.addLayout(results_layout)
-        main_layout.addWidget(center_group)
         main_layout.addWidget(self.lbl_status)
         
         central.setLayout(main_layout)
@@ -313,6 +307,7 @@ class BackgroundSubtractionApp(QMainWindow):
         self.btn_capture_target.clicked.connect(self.capture_target)
         
         self.btn_process.clicked.connect(self.process_background_subtraction)
+        self.btn_detect_rim.clicked.connect(self.detect_rim_from_mask)
         
         self.slider_min_dev.valueChanged.connect(self.update_params)
         self.slider_max_dev.valueChanged.connect(self.update_params)
@@ -321,6 +316,7 @@ class BackgroundSubtractionApp(QMainWindow):
         # Store result images for saving
         self.result_heatmap = None
         self.result_mask = None
+        self.bg_mask = None
         self.result_overlay = None
         self.wheel_center_info = None
     
@@ -643,6 +639,419 @@ class BackgroundSubtractionApp(QMainWindow):
         logger.warning(f"No valid depth found at ({x}, {y}) even with 150x150 window")
         return 0.0
     
+    def detect_rim_from_mask(self):
+        """Detect rim from the background subtraction mask"""
+        if self.bg_mask is None:
+            QMessageBox.warning(self, "Rim Detection", "Run background subtraction first.")
+            return
+        
+        if self.wheel_center_info is None or self.wheel_center_info.get('center_x') is None:
+            QMessageBox.warning(self, "Rim Detection", "Wheel center not detected. Process background subtraction first.")
+            return
+        
+        # Use captured depth frame if available, otherwise current depth frame
+        depth_frame = None
+        if self.current_mode == "realsense":
+            if self.captured_depth_frame is not None:
+                depth_frame = self.captured_depth_frame
+                logger.info("Using captured depth frame for rim detection")
+            else:
+                depth_frame = self.current_depth_frame
+                logger.info("Using current depth frame for rim detection")
+        
+        try:
+            self.lbl_status.setText("Detecting rim...")
+            
+            # Get parameters
+            depth_tolerance_pct = self.spin_depth_tol.value() / 100.0
+            use_depth_filter = self.chk_depth_filter.isChecked()
+            
+            # Get wheel center depth
+            center_depth_mm = self.wheel_center_info.get('depth_mm')
+            # If no depth frame, force depth filter off
+            if depth_frame is None:
+                use_depth_filter = False
+                center_depth_mm = None
+            # If depth filter requested but depth is invalid, disable filtering
+            if use_depth_filter and (center_depth_mm is None or center_depth_mm <= 0):
+                logger.warning("Wheel center depth unavailable; disabling depth filter.")
+                use_depth_filter = False
+            
+            # Apply depth filter to mask - VECTORIZED VERSION for better performance
+            # Convert depth frame to float32 for better precision (only if we have depth)
+            depth_frame_float = depth_frame.astype(np.float32) if depth_frame is not None else None
+            
+            actual_min_depth = None
+            actual_max_depth = None
+            actual_median_depth = None
+            depth_min = None
+            depth_max = None
+            
+            if use_depth_filter and depth_frame_float is not None:
+                # Analyze depth range in the current mask and build a filtered mask around center depth
+                mask_depths = depth_frame_float[self.bg_mask > 0]
+                valid_mask_depths = mask_depths[mask_depths > 0]
+                
+                if len(valid_mask_depths) == 0:
+                    logger.warning("No valid depth pixels in mask; skipping depth filter")
+                    use_depth_filter = False
+                else:
+                    actual_min_depth = float(np.min(valid_mask_depths))
+                    actual_max_depth = float(np.max(valid_mask_depths))
+                    actual_median_depth = float(np.median(valid_mask_depths))
+                    # Use ABSOLUTE mm tolerance (constant across all distances)
+                    depth_min = center_depth_mm - self.depth_tolerance_mm
+                    depth_max = center_depth_mm + self.depth_tolerance_mm
+                    logger.info(f"Depth filter ON (ABSOLUTE): center {center_depth_mm:.1f}mm, range {depth_min:.1f}-{depth_max:.1f}mm (±{self.depth_tolerance_mm}mm), mask depth {actual_min_depth:.1f}-{actual_max_depth:.1f}mm")
+            
+            if use_depth_filter and depth_frame_float is not None:
+                depth_condition = (depth_frame_float >= depth_min) & (depth_frame_float <= depth_max)
+                mask_condition = self.bg_mask > 0
+                depth_filtered_mask = np.where(depth_condition & mask_condition, 255, 0).astype(np.uint8)
+                
+                # Apply morphological operations to fill gaps and smooth edges
+                # kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                # depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+                
+                # kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                # depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+            else:
+                # Use the background subtraction mask directly to compare behavior without depth gating
+                depth_filtered_mask = self.bg_mask.copy()
+                logger.info("Depth filter OFF: running Hough on background mask only")
+            
+            # Find contours in depth-filtered mask
+            contours, _ = cv2.findContours(depth_filtered_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                logger.warning("No contours found after depth filtering")
+                return
+            
+            # IMPROVED HOUGH LINE DETECTION: Focus on rim band only
+            wheel_center_y = self.wheel_center_info['center_y']
+            wheel_center_x = self.wheel_center_info['center_x']
+            
+            # Get wheel dimensions from largest contour for adaptive scaling
+            main_contour = max(contours, key=cv2.contourArea)
+            wheel_x, wheel_y, wheel_w, wheel_h = cv2.boundingRect(main_contour)
+            logger.info(f"Wheel bounding box: x={wheel_x}, y={wheel_y}, w={wheel_w}, h={wheel_h}")
+            
+            # Create focused region: horizontal band around wheel center (ADAPTIVE based on wheel height)
+            h, w = depth_filtered_mask.shape
+            band_height = int(wheel_h * (1))  # % of actual wheel height
+            y_band_start = max(0, wheel_center_y - band_height)
+            y_band_end = min(h, wheel_center_y + band_height)
+            logger.info(f"Adaptive band: height={band_height}px ({self.band_height_percent}% of wheel {wheel_h}px)")
+            
+            # Extract rim band only
+            rim_band = depth_filtered_mask[y_band_start:y_band_end, :].copy()
+            
+            # Dilate the mask to smooth sharp edges and connect gaps before edge detection
+            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            rim_band_dilated = cv2.dilate(rim_band, dilate_kernel, iterations=1)
+            
+           
+            if self.target_image is not None:
+                hough_viz = self.target_image.copy()
+                
+            
+            
+        
+            if 1:
+                # Fallback: use projection method on rim band
+                vertical_proj = np.sum(rim_band, axis=1)
+                non_zero_rows = np.where(vertical_proj > vertical_proj.max() * 0.8)[0]
+                if len(non_zero_rows) > 0:
+                    y_top = non_zero_rows[0] + y_band_start
+                    y_bottom = non_zero_rows[-1] + y_band_start
+                else:
+                    y_top = y_band_start + 10
+                    y_bottom = y_band_end - 10
+                logger.info(f"Projection fallback: y={y_top} to y={y_bottom}")
+            
+            # Find left and right boundaries from mask width (not from vertical lines)
+            # Use horizontal projection to find leftmost and rightmost non-zero columns
+            horizontal_proj = np.sum(depth_filtered_mask, axis=0)
+            non_zero_cols = np.where(horizontal_proj > 0)[0]
+            if len(non_zero_cols) > 0:
+                x_left = non_zero_cols[0]
+                x_right = non_zero_cols[-1]
+                logger.info(f"Left/Right boundaries from mask width: x={x_left} to x={x_right}")
+            else:
+                x_left = max(0, wheel_center_x - 150)
+                x_right = min(depth_filtered_mask.shape[1] - 1, wheel_center_x + 150)
+                logger.info(f"Fallback left/right: x={x_left} to x={x_right}")
+            
+            # Add margin for safety
+            margin = 0
+            y_top = max(0, y_top - margin)
+            y_bottom = min(depth_filtered_mask.shape[0] - 1, y_bottom + margin)
+            x_left = max(0, x_left - margin)
+            x_right = min(depth_filtered_mask.shape[1] - 1, x_right + margin)
+            
+            # Draw final chosen boundaries (top and bottom only) in WHITE
+            cv2.line(hough_viz, (0, y_top), (w-1, y_top), (255, 255, 255), 3)  # Top boundary
+            cv2.line(hough_viz, (0, y_bottom), (w-1, y_bottom), (255, 255, 255), 3)  # Bottom boundary
+            
+            # Draw final rectangle in YELLOW (BGR: 0, 255, 255)
+            cv2.rectangle(hough_viz, (x_left, y_top), (x_right, y_bottom), (0, 255, 255), 2)
+            
+            # Add legend text
+            cv2.putText(hough_viz, "RED=All Lines | BLUE=Horizontal Filtered | WHITE=Top/Bottom | YELLOW=Final Rect", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Display binary mask in lbl_mask (Background Mask Result)
+            self.lbl_mask.setPixmap(
+                ndarray_to_qpixmap(depth_filtered_mask, is_bgr=False).scaled(
+                    self.lbl_mask.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+            
+            # Display Hough visualization with lines and rectangle in lbl_overlay
+            self.lbl_overlay.setPixmap(
+                ndarray_to_qpixmap(hough_viz, is_bgr=True).scaled(
+                    self.lbl_overlay.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+            
+            # Create rim mask from detected boundaries
+            rim_only_mask = np.zeros_like(depth_filtered_mask)
+            rim_only_mask[y_top:y_bottom+1, x_left:x_right+1] = depth_filtered_mask[y_top:y_bottom+1, x_left:x_right+1]
+            
+            # Create rectangular contour from boundaries
+            main_contour = np.array([
+                [[x_left, y_top]], 
+                [[x_right, y_top]], 
+                [[x_right, y_bottom]], 
+                [[x_left, y_bottom]]
+            ])
+            
+            # Use the rim mask
+            depth_filtered_mask = rim_only_mask
+            
+            logger.info(f"Hough rim detection: Rect[{x_left},{y_top}] to [{x_right},{y_bottom}]")
+            logger.info(f"Main contour dimensions: width={x_right-x_left}px, height={y_bottom-y_top}px")
+            
+            # Final rim mask from detected contour
+            rim_mask = np.zeros_like(depth_filtered_mask)
+            cv2.drawContours(rim_mask, [main_contour], -1, 255, -1)
+            
+            # Calculate rim properties
+            rim_area = cv2.contourArea(main_contour)
+            rim_x, rim_y, rim_w, rim_h = cv2.boundingRect(main_contour)
+            
+            logger.info(f"Rim bounding box from contour: x={rim_x}, y={rim_y}, w={rim_w}, h={rim_h}")
+            
+            # Get rim center
+            M = cv2.moments(main_contour)
+            if M["m00"] != 0:
+                rim_center_x = int(M["m10"] / M["m00"])
+                rim_center_y = int(M["m01"] / M["m00"])
+            else:
+                rim_center_x = rim_x + rim_w // 2
+                rim_center_y = rim_y + rim_h // 2
+            
+            # Get rim depth only if a depth frame is available
+            rim_depth = None
+            if depth_frame is not None:
+                rim_depth = self.get_depth_at_point(rim_center_x, rim_center_y, depth_frame)
+            
+            # Convert pixel measurements to mm using depth projection
+            # Use center-based approach like measure_height_from_mask in realsense.py
+            rim_height_mm = None
+            measurement_points = None  # Store measurement points for visualization
+            
+            # Try to initialize depth processor if not already done and streamer is available
+            if self.depth_processor is None and self.streamer is not None:
+                if self.streamer.intrinsics and self.streamer.depth_scale:
+                    self.depth_processor = DepthProcessor(self.streamer.intrinsics, self.streamer.depth_scale)
+                    logger.info("Depth processor initialized on-demand with camera intrinsics")
+                else:
+                    logger.warning("Streamer available but intrinsics not ready")
+            
+            # Log camera intrinsics for debugging
+            if self.depth_processor is not None:
+                intr = self.depth_processor.intrinsics
+                logger.info(f"Camera intrinsics: fx={intr['fx']:.2f}, fy={intr['fy']:.2f}, cx={intr['cx']:.2f}, cy={intr['cy']:.2f}, resolution={intr['width']}x{intr['height']}")
+                logger.info(f"Depth scale: {self.depth_processor.depth_scale}")
+            
+            if depth_frame is not None and self.depth_processor is not None and rim_depth is not None and rim_depth > 0:
+                try:
+                    # Use center 40% of rim mask for height calculation (similar to measure_height_from_mask)
+                    rim_center_start_x = rim_x + int(rim_w * 0.30)
+                    rim_center_end_x = rim_x + int(rim_w * 0.70)
+                    
+                    # Find actual mask pixels in center vertical band for height measurement
+                    ys_vertical, xs_vertical = np.where(
+                        rim_mask[rim_y:rim_y+rim_h, rim_center_start_x:rim_center_end_x] > 0
+                    )
+                    
+                    # Calculate HEIGHT using vertical center band
+                    if len(ys_vertical) > 0:
+                        # Adjust coordinates to full image
+                        xs_vertical_adj = xs_vertical + rim_center_start_x
+                        ys_vertical_adj = ys_vertical + rim_y
+                        
+                        # Find top and bottom points
+                        top_y_actual = int(np.min(ys_vertical_adj))
+                        bottom_y_actual = int(np.max(ys_vertical_adj))
+                        
+                        # Use rim center x for height measurement
+                        height_center_x = rim_center_x
+                        
+                        # Get depth at top and bottom
+                        top_depth = self.depth_processor.get_depth_at_point(height_center_x, top_y_actual, depth_frame)
+                        bottom_depth = self.depth_processor.get_depth_at_point(height_center_x, bottom_y_actual, depth_frame)
+                        if top_depth != 0 or bottom_depth != 0:
+                            if top_depth == 0:
+                                top_depth = bottom_depth
+                            if bottom_depth == 0:
+                                bottom_depth = top_depth
+                        if top_depth == 0 and bottom_depth == 0:
+                            if wheel_center_x!=0 and wheel_center_y!=0:
+                                center_depth = self.depth_processor.get_depth_at_point(wheel_center_x, wheel_center_y, depth_frame)
+                                top_depth = center_depth
+                                bottom_depth = center_depth
+                        logger.info(f"Depth values: top_depth={top_depth:.2f}mm at (x={height_center_x}, y={top_y_actual}), bottom_depth={bottom_depth:.2f}mm at (x={height_center_x}, y={bottom_y_actual})")
+                        
+                        if top_depth > 0 and bottom_depth > 0:
+                            # Deproject to 3D
+                            top_3d = self.depth_processor.deproject_pixel_to_3d(height_center_x, top_y_actual, top_depth)
+                            bottom_3d = self.depth_processor.deproject_pixel_to_3d(height_center_x, bottom_y_actual, bottom_depth)
+                            
+                            logger.info(f"3D points: top={top_3d}, bottom={bottom_3d}")
+                            
+                            # Calculate height using only X and Y coordinates (ignore Z/depth)
+                            delta_x = top_3d[0] - bottom_3d[0]
+                            delta_y = top_3d[1] - bottom_3d[1]
+                            
+                            logger.info(f"Deltas: delta_x={delta_x}, delta_y={delta_y}")
+                            
+                            rim_height_mm = np.sqrt(delta_x**2 + delta_y**2)
+                            
+                            # Store measurement points for visualization
+                            measurement_points = {
+                                'top': (height_center_x, top_y_actual),
+                                'bottom': (height_center_x, bottom_y_actual)
+                            }
+                            
+                            logger.info(f"Rim height: {rim_height_mm:.2f}mm (top_y={top_y_actual}, bottom_y={bottom_y_actual}, center_x={height_center_x})")
+                        else:
+                            logger.warning("Invalid depth for height measurement")
+                    else:
+                        logger.warning("No mask pixels in vertical center band for height measurement")
+                    
+                except Exception as e:
+                    logger.error(f"Error converting rim measurements to mm: {e}", exc_info=True)
+                    rim_height_mm = None
+            else:
+                logger.warning(f"Cannot compute mm measurements - depth_frame: {depth_frame is not None}, depth_processor: {self.depth_processor is not None}, rim_depth: {rim_depth}")
+            
+            # Store results
+            self.rim_detection_result = {
+                'contour': main_contour,
+                'mask': rim_mask,
+                'center_x': rim_center_x,
+                'center_y': rim_center_y,
+                'depth_mm': float(rim_depth) if rim_depth is not None else None,
+                'depth_m': float(rim_depth) / 1000.0 if rim_depth is not None else None,
+                'area_pixels': int(rim_area),
+                'bbox': (rim_x, rim_y, rim_w, rim_h),
+                'width_pixels': rim_w,
+                'height_pixels': rim_h,
+                'height_mm': float(rim_height_mm) if rim_height_mm is not None else None
+            }
+            
+            # Create rim overlay
+            if self.target_image is not None:
+                rim_overlay = self.target_image.copy()
+                
+                # Draw rim contour in cyan
+                cv2.drawContours(rim_overlay, [main_contour], -1, (255, 255, 0), 3)
+                
+                # Draw rim center
+                cv2.drawMarker(rim_overlay, (rim_center_x, rim_center_y), 
+                              (255, 0, 255), cv2.MARKER_CROSS, 30, 3)
+                cv2.circle(rim_overlay, (rim_center_x, rim_center_y), 5, (255, 0, 255), -1)
+                
+                # Draw bounding box
+                cv2.rectangle(rim_overlay, (rim_x, rim_y), (rim_x + rim_w, rim_y + rim_h),
+                            (0, 255, 255), 2)
+                
+                # Draw measurement points (top_y and bottom_y where depth is read)
+                if measurement_points is not None:
+                    top_pt = measurement_points['top']
+                    bottom_pt = measurement_points['bottom']
+                    
+                    # Draw top measurement point in GREEN
+                    cv2.circle(rim_overlay, top_pt, 8, (0, 255, 0), -1)
+                    cv2.circle(rim_overlay, top_pt, 12, (0, 255, 0), 2)
+                    cv2.putText(rim_overlay, "TOP", (top_pt[0] + 15, top_pt[1] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
+                    # Draw bottom measurement point in RED
+                    cv2.circle(rim_overlay, bottom_pt, 8, (0, 0, 255), -1)
+                    cv2.circle(rim_overlay, bottom_pt, 12, (0, 0, 255), 2)
+                    cv2.putText(rim_overlay, "BOTTOM", (bottom_pt[0] + 15, bottom_pt[1] + 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    
+                    # Draw line connecting measurement points
+                    cv2.line(rim_overlay, top_pt, bottom_pt, (255, 255, 255), 2)
+                    
+                    # Add height label if available
+                    if rim_height_mm is not None:
+                        mid_y = (top_pt[1] + bottom_pt[1]) // 2
+                        cv2.putText(rim_overlay, f"{rim_height_mm:.1f}mm", (top_pt[0] + 20, mid_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Add labels
+                cv2.putText(rim_overlay, f"Rim: {rim_w}x{rim_h}px", (rim_x, rim_y - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                self.rim_overlay = rim_overlay
+                
+                # Display
+                self.lbl_overlay.setPixmap(
+                    ndarray_to_qpixmap(rim_overlay, is_bgr=True).scaled(
+                        self.lbl_overlay.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                )
+            
+            # Display results
+            info_lines = [
+                f"Rim Center (X, Y): ({rim_center_x}, {rim_center_y}) pixels",
+                f"Rim Size: {rim_w} x {rim_h} pixels",
+            ]
+            
+            # Add height in mm if available
+            if rim_height_mm is not None:
+                info_lines.append(f"Rim Height (3D): {rim_height_mm:.2f} mm")
+            else:
+                info_lines.append(f"Rim Height (3D): Not available (need depth + intrinsics)")
+            
+            info_lines.append(f"Rim Area: {rim_area:.0f} pixels²")
+            info_lines.append(f"Depth Filter: {'ON' if use_depth_filter else 'OFF'}")
+
+            if center_depth_mm is not None:
+                info_lines.append(f"Wheel Center Depth: {center_depth_mm:.1f} mm")
+            else:
+                info_lines.append("Wheel Center Depth: n/a (no depth)")
+            
+            # Add actual depth range analysis
+
+            
+            # Update status with height measurement if available
+            if rim_height_mm is not None:
+                self.lbl_status.setText(f"Rim detected: {rim_w}x{rim_h} px (height: {rim_height_mm:.2f} mm)")
+            else:
+                self.lbl_status.setText(f"Rim detected: {rim_w}x{rim_h} pixels")
+            
+            # logger.info(f"Rim detected at ({rim_center_x}, {rim_center_y}) with depth {rim_depth:.1f}mm")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Rim Detection Error", f"Failed to detect rim: {e}")
+            logger.error(f"Rim detection error: {e}", exc_info=True)
+
     def process_background_subtraction(self):
         """Run background subtraction algorithm"""
         background_to_use = self.background_image
@@ -701,6 +1110,7 @@ class BackgroundSubtractionApp(QMainWindow):
                     valid_contours.append(contour)
             
             self.result_mask = filtered_mask
+            self.bg_mask = filtered_mask # if smaller contours should be removed.
             
             # Create overlay (UI specific logic)
             # Ensure target image size matches
@@ -791,9 +1201,11 @@ class BackgroundSubtractionApp(QMainWindow):
                 info_lines.append(f"Note: {wheel_info['error']}")
             
             if info_lines:
-                self.lbl_wheel_info.setText("\n".join(info_lines))
+                # self.lbl_wheel_info.setText("\n".join(info_lines))
+                logger.info(f"Wheel center info: {' | '.join(info_lines)}")
             else:
-                self.lbl_wheel_info.setText("Could not detect wheel center")
+                # self.lbl_wheel_info.setText("Could not detect wheel center")
+                logger.info("Could not detect wheel center")
             
             # Calculate statistics
             mask_pixels = np.sum(filtered_mask > 0)

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QSpinBox,
     QFormLayout,
+    QDialog,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,10 @@ class RealSenseStreamer:
         
         self.color_frame = None
         self.depth_frame = None
+        
+        # Camera intrinsics and depth scale
+        self.intrinsics = None
+        self.depth_scale = 0.001  # Default depth scale
     
     def initialize(self) -> bool:
         """Initialize RealSense pipeline"""
@@ -86,10 +91,26 @@ class RealSenseStreamer:
             
             # Configure depth sensor
             depth_sensor = profile.get_device().first_depth_sensor()
+            self.depth_scale = depth_sensor.get_depth_scale()
+            
             if depth_sensor.supports(rs.option.visual_preset):
                 depth_sensor.set_option(rs.option.visual_preset, 3)  # High Accuracy
             
-            logger.info("RealSense camera initialized")
+            # Get camera intrinsics from color stream (aligned to depth)
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intr = color_profile.get_intrinsics()
+            
+            self.intrinsics = {
+                'fx': intr.fx,
+                'fy': intr.fy,
+                'cx': intr.ppx,
+                'cy': intr.ppy,
+                'width': intr.width,
+                'height': intr.height
+            }
+            
+            logger.info(f"RealSense camera initialized - fx={self.intrinsics['fx']:.1f}, fy={self.intrinsics['fy']:.1f}")
+            logger.info(f"Depth scale: {self.depth_scale}")
             return True
             
         except Exception as e:
@@ -134,6 +155,85 @@ class RealSenseStreamer:
             logger.error(f"Cleanup error: {e}")
 
 
+class DepthProcessor:
+    """Handle depth-based 3D measurements"""
+    
+    def __init__(self, intrinsics: dict, depth_scale: float = 0.001):
+        """Initialize depth processor
+        
+        Args:
+            intrinsics: Camera intrinsic parameters (dict with fx, fy, cx, cy, width, height)
+            depth_scale: Depth scale factor (mm per unit)
+        """
+        self.intrinsics = intrinsics
+        self.depth_scale = depth_scale
+    
+    def deproject_pixel_to_3d(self, x: float, y: float, depth: float) -> tuple:
+        """Convert 2D pixel to 3D world coordinates using depth
+        
+        Args:
+            x: Pixel x coordinate
+            y: Pixel y coordinate
+            depth: Depth value in raw units
+            
+        Returns:
+            3D point (x, y, z) in millimeters
+        """
+        try:
+            # Create intrinsics object for pyrealsense2
+            intr = rs.intrinsics()
+            intr.fx = self.intrinsics['fx']
+            intr.fy = self.intrinsics['fy']
+            intr.ppx = self.intrinsics['cx']
+            intr.ppy = self.intrinsics['cy']
+            intr.width = self.intrinsics['width']
+            intr.height = self.intrinsics['height']
+            intr.model = rs.distortion.none
+            intr.coeffs = [0, 0, 0, 0, 0]
+            
+            # Deproject pixel to 3D (RealSense expects depth in meters)
+            # depth is in raw units, depth_scale converts to meters
+            depth_m = depth * self.depth_scale
+            point_3d = rs.rs2_deproject_pixel_to_point(intr, [x, y], depth_m)
+            
+            # rs2_deproject_pixel_to_point returns coordinates in meters, convert to mm
+            return (point_3d[0] * 1000, point_3d[1] * 1000, point_3d[2] * 1000)
+        
+        except Exception as e:
+            logger.error(f"Error deprojecting pixel: {e}")
+            return (0, 0, 0)
+    
+    def get_depth_at_point(self, x: int, y: int, depth_frame: np.ndarray, 
+                          window_size: int = 15) -> float:
+        """Get valid depth value in a window around specified point
+        
+        Args:
+            x: Pixel x coordinate
+            y: Pixel y coordinate
+            depth_frame: Depth image array
+            window_size: Size of window for averaging
+            
+        Returns:
+            Depth value in raw units
+        """
+        h, w = depth_frame.shape
+        x = np.clip(x, 0, w - 1)
+        y = np.clip(y, 0, h - 1)
+        
+        half_window = window_size // 2
+        x_start = max(x - half_window, 0)
+        x_end = min(x + half_window + 1, w)
+        y_start = max(y - half_window, 0)
+        y_end = min(y + half_window + 1, h)
+        
+        window = depth_frame[y_start:y_end, x_start:x_end]
+        valid_depths = window[(window > 0) & (window < 65535)]
+        
+        if len(valid_depths) > 0:
+            return float(np.median(valid_depths))
+        return 0.0
+
+
 class BackgroundSubtractionApp(QMainWindow):
     """Main application for background subtraction"""
     
@@ -153,11 +253,34 @@ class BackgroundSubtractionApp(QMainWindow):
         self.stream_thread = None
         self.current_color_frame = None
         self.current_depth_frame = None
+        self.depth_processor = None  # Initialized when camera starts
         
         # Parameters
         self.min_deviation = 10
         self.max_deviation = 255
-        self.min_contour_area = 1000
+        self.min_contour_area = 5000
+        
+        # Adaptive rim detection parameters
+        self.band_height_percent = 40  # % of wheel height for search band
+        self.hough_min_line_percent = 25  # % of wheel width for minLineLength
+        self.hough_max_gap_percent = 5  # % of wheel width for maxLineGap
+        self.depth_tolerance_mm = 50  # Absolute mm tolerance (not percentage)
+        self.rim_height_min_ratio = 15  # Min rim height as % of wheel height
+        self.rim_height_max_ratio = 35  # Max rim height as % of wheel height
+        
+        # Adaptive parameter widgets (created in dialog)
+        self.slider_band_height = None
+        self.slider_hough_min_line = None
+        self.slider_hough_max_gap = None
+        self.slider_depth_tol_abs = None
+        self.slider_rim_height_min = None
+        self.slider_rim_height_max = None
+        self.lbl_band_height = None
+        self.lbl_hough_min_line = None
+        self.lbl_hough_max_gap = None
+        self.lbl_depth_tol_abs = None
+        self.lbl_rim_height_min = None
+        self.lbl_rim_height_max = None
         
         # Capture directory
         self.capture_dir = (Path(__file__).parent / "captures").resolve()
@@ -176,6 +299,16 @@ class BackgroundSubtractionApp(QMainWindow):
         self.setCentralWidget(central)
         
         main_layout = QVBoxLayout()
+        
+        # Advanced settings button at top
+        top_controls_layout = QHBoxLayout()
+        self.btn_adaptive_params = QPushButton("⚙ Adaptive Parameters")
+        self.btn_adaptive_params.setStyleSheet("font-size: 12px; padding: 8px; background-color: #FF9800; color: white;")
+        self.btn_adaptive_params.setMaximumWidth(200)
+        self.btn_adaptive_params.setToolTip("Open adaptive detection parameters dialog")
+        top_controls_layout.addWidget(self.btn_adaptive_params)
+        top_controls_layout.addStretch()
+        main_layout.addLayout(top_controls_layout)
         
         # Mode selection
         mode_group = QGroupBox("Image Source")
@@ -240,7 +373,7 @@ class BackgroundSubtractionApp(QMainWindow):
         params_layout = QFormLayout()
         
         self.slider_min_dev = QSlider(Qt.Horizontal)
-        self.slider_min_dev.setRange(0, 100)
+        self.slider_min_dev.setRange(5, 150)
         self.slider_min_dev.setValue(self.min_deviation)
         self.lbl_min_dev = QLabel(str(self.min_deviation))
         
@@ -250,9 +383,9 @@ class BackgroundSubtractionApp(QMainWindow):
         self.lbl_max_dev = QLabel(str(self.max_deviation))
         
         self.spin_min_area = QSpinBox()
-        self.spin_min_area.setRange(0, 100000)
+        self.spin_min_area.setRange(500, 200000)
         self.spin_min_area.setValue(self.min_contour_area)
-        self.spin_min_area.setSingleStep(100)
+        self.spin_min_area.setSingleStep(500)
         
         min_dev_layout = QHBoxLayout()
         min_dev_layout.addWidget(self.slider_min_dev)
@@ -390,6 +523,8 @@ class BackgroundSubtractionApp(QMainWindow):
         self.btn_detect_rim.clicked.connect(self.detect_rim_from_mask)
         self.btn_save.clicked.connect(self.save_results)
         
+        self.btn_adaptive_params.clicked.connect(self.show_adaptive_params_dialog)
+        
         self.slider_min_dev.valueChanged.connect(self.update_params)
         self.slider_max_dev.valueChanged.connect(self.update_params)
         self.spin_min_area.valueChanged.connect(self.update_params)
@@ -411,6 +546,107 @@ class BackgroundSubtractionApp(QMainWindow):
             self.current_mode = "realsense"
             self.lbl_status.setText("Mode: RealSense - Load shared background, start camera and capture target")
     
+    def show_adaptive_params_dialog(self):
+        """Show dialog with adaptive detection parameters"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Adaptive Detection Parameters")
+        dialog.setMinimumWidth(500)
+        
+        layout = QFormLayout()
+        
+        # Create sliders and labels
+        self.slider_band_height = QSlider(Qt.Horizontal)
+        self.slider_band_height.setRange(10, 100)
+        self.slider_band_height.setValue(self.band_height_percent)
+        self.slider_band_height.setToolTip("Search band height as % of detected wheel height (40% = ±40% around center)")
+        self.lbl_band_height = QLabel(str(self.band_height_percent))
+        
+        self.slider_hough_min_line = QSlider(Qt.Horizontal)
+        self.slider_hough_min_line.setRange(10, 50)
+        self.slider_hough_min_line.setValue(self.hough_min_line_percent)
+        self.slider_hough_min_line.setToolTip("Minimum line length as % of wheel width (25% works well)")
+        self.lbl_hough_min_line = QLabel(str(self.hough_min_line_percent))
+        
+        self.slider_hough_max_gap = QSlider(Qt.Horizontal)
+        self.slider_hough_max_gap.setRange(1, 20)
+        self.slider_hough_max_gap.setValue(self.hough_max_gap_percent)
+        self.slider_hough_max_gap.setToolTip("Maximum gap between line segments as % of wheel width")
+        self.lbl_hough_max_gap = QLabel(str(self.hough_max_gap_percent))
+        
+        self.slider_depth_tol_abs = QSlider(Qt.Horizontal)
+        self.slider_depth_tol_abs.setRange(10, 200)
+        self.slider_depth_tol_abs.setValue(self.depth_tolerance_mm)
+        self.slider_depth_tol_abs.setToolTip("Absolute depth tolerance in mm (±50mm works for most cases, constant across distances)")
+        self.lbl_depth_tol_abs = QLabel(str(self.depth_tolerance_mm))
+        
+        self.slider_rim_height_min = QSlider(Qt.Horizontal)
+        self.slider_rim_height_min.setRange(5, 50)
+        self.slider_rim_height_min.setValue(self.rim_height_min_ratio)
+        self.slider_rim_height_min.setToolTip("Minimum rim height as % of wheel height (15% typical)")
+        self.lbl_rim_height_min = QLabel(str(self.rim_height_min_ratio))
+        
+        self.slider_rim_height_max = QSlider(Qt.Horizontal)
+        self.slider_rim_height_max.setRange(20, 80)
+        self.slider_rim_height_max.setValue(self.rim_height_max_ratio)
+        self.slider_rim_height_max.setToolTip("Maximum rim height as % of wheel height (35% typical)")
+        self.lbl_rim_height_max = QLabel(str(self.rim_height_max_ratio))
+        
+        # Connect sliders to update function
+        self.slider_band_height.valueChanged.connect(self.update_adaptive_params)
+        self.slider_hough_min_line.valueChanged.connect(self.update_adaptive_params)
+        self.slider_hough_max_gap.valueChanged.connect(self.update_adaptive_params)
+        self.slider_depth_tol_abs.valueChanged.connect(self.update_adaptive_params)
+        self.slider_rim_height_min.valueChanged.connect(self.update_adaptive_params)
+        self.slider_rim_height_max.valueChanged.connect(self.update_adaptive_params)
+        
+        # Create layouts for each parameter
+        band_height_layout = QHBoxLayout()
+        band_height_layout.addWidget(self.slider_band_height)
+        band_height_layout.addWidget(self.lbl_band_height)
+        
+        hough_min_line_layout = QHBoxLayout()
+        hough_min_line_layout.addWidget(self.slider_hough_min_line)
+        hough_min_line_layout.addWidget(self.lbl_hough_min_line)
+        
+        hough_max_gap_layout = QHBoxLayout()
+        hough_max_gap_layout.addWidget(self.slider_hough_max_gap)
+        hough_max_gap_layout.addWidget(self.lbl_hough_max_gap)
+        
+        depth_tol_abs_layout = QHBoxLayout()
+        depth_tol_abs_layout.addWidget(self.slider_depth_tol_abs)
+        depth_tol_abs_layout.addWidget(self.lbl_depth_tol_abs)
+        
+        rim_height_min_layout = QHBoxLayout()
+        rim_height_min_layout.addWidget(self.slider_rim_height_min)
+        rim_height_min_layout.addWidget(self.lbl_rim_height_min)
+        
+        rim_height_max_layout = QHBoxLayout()
+        rim_height_max_layout.addWidget(self.slider_rim_height_max)
+        rim_height_max_layout.addWidget(self.lbl_rim_height_max)
+        
+        # Add to layout
+        layout.addRow("Band Height %:", band_height_layout)
+        layout.addRow("Hough Min Line %:", hough_min_line_layout)
+        layout.addRow("Hough Max Gap %:", hough_max_gap_layout)
+        layout.addRow("Depth Tolerance (mm):", depth_tol_abs_layout)
+        layout.addRow("Rim Height Min %:", rim_height_min_layout)
+        layout.addRow("Rim Height Max %:", rim_height_max_layout)
+        
+        # Add info label
+        info_label = QLabel("\nThese parameters auto-scale based on detected wheel size.\n" 
+                           "Defaults work for most cases. Adjust only if detection fails.")
+        info_label.setStyleSheet("color: #888; font-size: 11px; padding: 10px;")
+        info_label.setWordWrap(True)
+        layout.addRow(info_label)
+        
+        # Add close button
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dialog.accept)
+        layout.addRow(btn_close)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
+    
     def update_params(self):
         """Update parameters from UI"""
         self.min_deviation = self.slider_min_dev.value()
@@ -419,8 +655,32 @@ class BackgroundSubtractionApp(QMainWindow):
         
         self.lbl_min_dev.setText(str(self.min_deviation))
         self.lbl_max_dev.setText(str(self.max_deviation))
+    
+    def update_adaptive_params(self):
+        """Update adaptive parameters from dialog sliders"""
+        if self.slider_band_height is not None:
+            self.band_height_percent = self.slider_band_height.value()
+            self.lbl_band_height.setText(str(self.band_height_percent))
         
-        # Rim parameters are read directly from spinboxes when needed
+        if self.slider_hough_min_line is not None:
+            self.hough_min_line_percent = self.slider_hough_min_line.value()
+            self.lbl_hough_min_line.setText(str(self.hough_min_line_percent))
+        
+        if self.slider_hough_max_gap is not None:
+            self.hough_max_gap_percent = self.slider_hough_max_gap.value()
+            self.lbl_hough_max_gap.setText(str(self.hough_max_gap_percent))
+        
+        if self.slider_depth_tol_abs is not None:
+            self.depth_tolerance_mm = self.slider_depth_tol_abs.value()
+            self.lbl_depth_tol_abs.setText(str(self.depth_tolerance_mm))
+        
+        if self.slider_rim_height_min is not None:
+            self.rim_height_min_ratio = self.slider_rim_height_min.value()
+            self.lbl_rim_height_min.setText(str(self.rim_height_min_ratio))
+        
+        if self.slider_rim_height_max is not None:
+            self.rim_height_max_ratio = self.slider_rim_height_max.value()
+            self.lbl_rim_height_max.setText(str(self.rim_height_max_ratio))
     
     def load_background(self):
         """Load background image from file (used for both modes)"""
@@ -468,6 +728,18 @@ class BackgroundSubtractionApp(QMainWindow):
             self.streamer = RealSenseStreamer()
             self.stream_thread = threading.Thread(target=self.streamer.run, daemon=True)
             self.stream_thread.start()
+            
+            # Wait briefly for initialization to get intrinsics
+            import time
+            time.sleep(1.0)
+            
+            # Initialize depth processor with camera intrinsics
+            if self.streamer.intrinsics and self.streamer.depth_scale:
+                self.depth_processor = DepthProcessor(self.streamer.intrinsics, self.streamer.depth_scale)
+                logger.info("Depth processor initialized with camera intrinsics")
+            else:
+                logger.warning("Camera intrinsics not yet available")
+            
             self.timer.start()
             self.lbl_status.setText("Camera started - Waiting for frames...")
         except Exception as e:
@@ -707,9 +979,10 @@ class BackgroundSubtractionApp(QMainWindow):
                     actual_min_depth = float(np.min(valid_mask_depths))
                     actual_max_depth = float(np.max(valid_mask_depths))
                     actual_median_depth = float(np.median(valid_mask_depths))
-                    depth_min = center_depth_mm * (1 - depth_tolerance_pct)
-                    depth_max = center_depth_mm * (1 + depth_tolerance_pct)
-                    logger.info(f"Depth filter ON: center {center_depth_mm:.1f}mm, range {depth_min:.1f}-{depth_max:.1f}mm, mask depth {actual_min_depth:.1f}-{actual_max_depth:.1f}mm")
+                    # Use ABSOLUTE mm tolerance (constant across all distances)
+                    depth_min = center_depth_mm - self.depth_tolerance_mm
+                    depth_max = center_depth_mm + self.depth_tolerance_mm
+                    logger.info(f"Depth filter ON (ABSOLUTE): center {center_depth_mm:.1f}mm, range {depth_min:.1f}-{depth_max:.1f}mm (±{self.depth_tolerance_mm}mm), mask depth {actual_min_depth:.1f}-{actual_max_depth:.1f}mm")
             
             if use_depth_filter and depth_frame_float is not None:
                 depth_condition = (depth_frame_float >= depth_min) & (depth_frame_float <= depth_max)
@@ -717,11 +990,11 @@ class BackgroundSubtractionApp(QMainWindow):
                 depth_filtered_mask = np.where(depth_condition & mask_condition, 255, 0).astype(np.uint8)
                 
                 # Apply morphological operations to fill gaps and smooth edges
-                kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+                # kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                # depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
                 
-                kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+                # kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                # depth_filtered_mask = cv2.morphologyEx(depth_filtered_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
             else:
                 # Use the background subtraction mask directly to compare behavior without depth gating
                 depth_filtered_mask = self.result_mask.copy()
@@ -738,11 +1011,17 @@ class BackgroundSubtractionApp(QMainWindow):
             wheel_center_y = self.wheel_center_info['center_y']
             wheel_center_x = self.wheel_center_info['center_x']
             
-            # Create focused region: horizontal band around wheel center (±25% of height)
+            # Get wheel dimensions from largest contour for adaptive scaling
+            main_contour = max(contours, key=cv2.contourArea)
+            wheel_x, wheel_y, wheel_w, wheel_h = cv2.boundingRect(main_contour)
+            logger.info(f"Wheel bounding box: x={wheel_x}, y={wheel_y}, w={wheel_w}, h={wheel_h}")
+            
+            # Create focused region: horizontal band around wheel center (ADAPTIVE based on wheel height)
             h, w = depth_filtered_mask.shape
-            band_height = int(h * 0.25)
+            band_height = int(wheel_h * (1))  # % of actual wheel height
             y_band_start = max(0, wheel_center_y - band_height)
             y_band_end = min(h, wheel_center_y + band_height)
+            logger.info(f"Adaptive band: height={band_height}px ({self.band_height_percent}% of wheel {wheel_h}px)")
             
             # Extract rim band only
             rim_band = depth_filtered_mask[y_band_start:y_band_end, :].copy()
@@ -751,107 +1030,17 @@ class BackgroundSubtractionApp(QMainWindow):
             dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             rim_band_dilated = cv2.dilate(rim_band, dilate_kernel, iterations=1)
             
-            # Apply edge detection on the dilated rim band
-            edges = cv2.Canny(rim_band_dilated, 50, 150, apertureSize=3)
-            
-            # Detect lines using Hough Line Transform with stricter parameters
-            lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi/180, threshold=50, 
-                                    minLineLength=100, maxLineGap=20)
-            
-            horizontal_lines = []
-            vertical_lines = []
-            
-            if lines is not None:
-                # Classify lines as horizontal or vertical
-                for line in lines:
-                    x1, y1, x2, y2 = line[0]
-                    
-                    # Adjust y coordinates back to full image
-                    y1_full = y1 + y_band_start
-                    y2_full = y2 + y_band_start
-                    
-                    # Calculate angle
-                    if x2 - x1 == 0:
-                        angle = 90
-                    else:
-                        angle = abs(np.degrees(np.arctan((y2 - y1) / (x2 - x1))))
-                    
-                    length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-                    
-                    # Horizontal lines (rim top/bottom edges) - very strict
-                    if angle < 10 and length > 80:  # Stricter: nearly horizontal and long
-                        avg_y = (y1_full + y2_full) / 2
-                        center_x_line = (x1 + x2) / 2
-                        
-                        # Filter: must be reasonably centered
-                        if abs(center_x_line - wheel_center_x) < w * 0.4:
-                            horizontal_lines.append({'y': avg_y, 'x1': x1, 'x2': x2, 'length': length})
-            
-            logger.info(f"Rim band [{y_band_start}-{y_band_end}]: {len(horizontal_lines)} horizontal lines detected")
-            
-            # Visualize detected Hough lines on target image (RGB overlay)
+           
             if self.target_image is not None:
                 hough_viz = self.target_image.copy()
-                if lines is not None:
-                    for line in lines:
-                        x1, y1, x2, y2 = line[0]
-                        # Adjust y coordinates back to full image
-                        y1_full = y1 + y_band_start
-                        y2_full = y2 + y_band_start
-                        # Draw all detected lines in red (thicker)
-                        cv2.line(hough_viz, (x1, y1_full), (x2, y2_full), (0, 0, 255), 3)
                 
-                # Draw horizontal lines in blue (thicker)
-                for h_line in horizontal_lines:
-                    y_pos = int(h_line['y'])
-                    cv2.line(hough_viz, (h_line['x1'], int(y_pos)), (h_line['x2'], int(y_pos)), (255, 0, 0), 4)
-            else:
-                # Fallback to mask if target image not available
-                hough_viz = cv2.cvtColor(depth_filtered_mask, cv2.COLOR_GRAY2BGR)
-                if lines is not None:
-                    for line in lines:
-                        x1, y1, x2, y2 = line[0]
-                        y1_full = y1 + y_band_start
-                        y2_full = y2 + y_band_start
-                        cv2.line(hough_viz, (x1, y1_full), (x2, y2_full), (0, 0, 255), 3)
-                
-                for h_line in horizontal_lines:
-                    y_pos = int(h_line['y'])
-                    cv2.line(hough_viz, (h_line['x1'], int(y_pos)), (h_line['x2'], int(y_pos)), (255, 0, 0), 4)
             
-            # Find rim boundaries from detected lines
-            if len(horizontal_lines) >= 2:
-                # Sort by length (strongest lines first)
-                horizontal_lines.sort(key=lambda l: l['length'], reverse=True)
-                
-                # Get y positions of strongest lines
-                y_positions = [l['y'] for l in horizontal_lines[:min(6, len(horizontal_lines))]]
-                
-                # Top edge: uppermost of the strong lines
-                y_top = int(min(y_positions))
-                
-                # Bottom edge: lowermost of the strong lines
-                y_bottom = int(max(y_positions))
-                
-                # Safety check: rim height should be reasonable (20-150 pixels)
-                rim_height = y_bottom - y_top
-                if rim_height < 50 or rim_height > 500:
-                    logger.warning(f"Rim height {rim_height}px seems wrong, using fallback")
-                    # Use projection fallback
-                    vertical_proj = np.sum(rim_band, axis=1)
-                    non_zero_rows = np.where(vertical_proj > vertical_proj.max() * 0.15)[0]
-                    if len(non_zero_rows) > 0:
-                        y_top = non_zero_rows[0] + y_band_start
-                        y_bottom = non_zero_rows[-1] + y_band_start
-                    else:
-                        y_top = y_band_start + 10
-                        y_bottom = y_band_end - 10
-                
-                logger.info(f"Hough: Top rim at y={y_top}, Bottom rim at y={y_bottom}, height={y_bottom-y_top}px")
-            else:
+            
+        
+            if 1:
                 # Fallback: use projection method on rim band
                 vertical_proj = np.sum(rim_band, axis=1)
-                non_zero_rows = np.where(vertical_proj > vertical_proj.max() * 0.4)[0]
+                non_zero_rows = np.where(vertical_proj > vertical_proj.max() * 0.8)[0]
                 if len(non_zero_rows) > 0:
                     y_top = non_zero_rows[0] + y_band_start
                     y_bottom = non_zero_rows[-1] + y_band_start
@@ -921,6 +1110,7 @@ class BackgroundSubtractionApp(QMainWindow):
             depth_filtered_mask = rim_only_mask
             
             logger.info(f"Hough rim detection: Rect[{x_left},{y_top}] to [{x_right},{y_bottom}]")
+            logger.info(f"Main contour dimensions: width={x_right-x_left}px, height={y_bottom-y_top}px")
             
             # Final rim mask from detected contour
             rim_mask = np.zeros_like(depth_filtered_mask)
@@ -929,6 +1119,8 @@ class BackgroundSubtractionApp(QMainWindow):
             # Calculate rim properties
             rim_area = cv2.contourArea(main_contour)
             rim_x, rim_y, rim_w, rim_h = cv2.boundingRect(main_contour)
+            
+            logger.info(f"Rim bounding box from contour: x={rim_x}, y={rim_y}, w={rim_w}, h={rim_h}")
             
             # Get rim center
             M = cv2.moments(main_contour)
@@ -944,6 +1136,97 @@ class BackgroundSubtractionApp(QMainWindow):
             if depth_frame is not None:
                 rim_depth = self.get_depth_at_point(rim_center_x, rim_center_y, depth_frame)
             
+            # Convert pixel measurements to mm using depth projection
+            # Use center-based approach like measure_height_from_mask in realsense.py
+            rim_height_mm = None
+            measurement_points = None  # Store measurement points for visualization
+            
+            # Try to initialize depth processor if not already done and streamer is available
+            if self.depth_processor is None and self.streamer is not None:
+                if self.streamer.intrinsics and self.streamer.depth_scale:
+                    self.depth_processor = DepthProcessor(self.streamer.intrinsics, self.streamer.depth_scale)
+                    logger.info("Depth processor initialized on-demand with camera intrinsics")
+                else:
+                    logger.warning("Streamer available but intrinsics not ready")
+            
+            # Log camera intrinsics for debugging
+            if self.depth_processor is not None:
+                intr = self.depth_processor.intrinsics
+                logger.info(f"Camera intrinsics: fx={intr['fx']:.2f}, fy={intr['fy']:.2f}, cx={intr['cx']:.2f}, cy={intr['cy']:.2f}, resolution={intr['width']}x{intr['height']}")
+                logger.info(f"Depth scale: {self.depth_processor.depth_scale}")
+            
+            if depth_frame is not None and self.depth_processor is not None and rim_depth is not None and rim_depth > 0:
+                try:
+                    # Use center 40% of rim mask for height calculation (similar to measure_height_from_mask)
+                    rim_center_start_x = rim_x + int(rim_w * 0.30)
+                    rim_center_end_x = rim_x + int(rim_w * 0.70)
+                    
+                    # Find actual mask pixels in center vertical band for height measurement
+                    ys_vertical, xs_vertical = np.where(
+                        rim_mask[rim_y:rim_y+rim_h, rim_center_start_x:rim_center_end_x] > 0
+                    )
+                    
+                    # Calculate HEIGHT using vertical center band
+                    if len(ys_vertical) > 0:
+                        # Adjust coordinates to full image
+                        xs_vertical_adj = xs_vertical + rim_center_start_x
+                        ys_vertical_adj = ys_vertical + rim_y
+                        
+                        # Find top and bottom points
+                        top_y_actual = int(np.min(ys_vertical_adj))
+                        bottom_y_actual = int(np.max(ys_vertical_adj))
+                        
+                        # Use rim center x for height measurement
+                        height_center_x = rim_center_x
+                        
+                        # Get depth at top and bottom
+                        top_depth = self.depth_processor.get_depth_at_point(height_center_x, top_y_actual, depth_frame)
+                        bottom_depth = self.depth_processor.get_depth_at_point(height_center_x, bottom_y_actual, depth_frame)
+                        if top_depth != 0 or bottom_depth != 0:
+                            if top_depth == 0:
+                                top_depth = bottom_depth
+                            if bottom_depth == 0:
+                                bottom_depth = top_depth
+                        if top_depth == 0 and bottom_depth == 0:
+                            if wheel_center_x!=0 and wheel_center_y!=0:
+                                center_depth = self.depth_processor.get_depth_at_point(wheel_center_x, wheel_center_y, depth_frame)
+                                top_depth = center_depth
+                                bottom_depth = center_depth
+                        logger.info(f"Depth values: top_depth={top_depth:.2f}mm at (x={height_center_x}, y={top_y_actual}), bottom_depth={bottom_depth:.2f}mm at (x={height_center_x}, y={bottom_y_actual})")
+                        
+                        if top_depth > 0 and bottom_depth > 0:
+                            # Deproject to 3D
+                            top_3d = self.depth_processor.deproject_pixel_to_3d(height_center_x, top_y_actual, top_depth)
+                            bottom_3d = self.depth_processor.deproject_pixel_to_3d(height_center_x, bottom_y_actual, bottom_depth)
+                            
+                            logger.info(f"3D points: top={top_3d}, bottom={bottom_3d}")
+                            
+                            # Calculate height using only X and Y coordinates (ignore Z/depth)
+                            delta_x = top_3d[0] - bottom_3d[0]
+                            delta_y = top_3d[1] - bottom_3d[1]
+                            
+                            logger.info(f"Deltas: delta_x={delta_x}, delta_y={delta_y}")
+                            
+                            rim_height_mm = np.sqrt(delta_x**2 + delta_y**2)
+                            
+                            # Store measurement points for visualization
+                            measurement_points = {
+                                'top': (height_center_x, top_y_actual),
+                                'bottom': (height_center_x, bottom_y_actual)
+                            }
+                            
+                            logger.info(f"Rim height: {rim_height_mm:.2f}mm (top_y={top_y_actual}, bottom_y={bottom_y_actual}, center_x={height_center_x})")
+                        else:
+                            logger.warning("Invalid depth for height measurement")
+                    else:
+                        logger.warning("No mask pixels in vertical center band for height measurement")
+                    
+                except Exception as e:
+                    logger.error(f"Error converting rim measurements to mm: {e}", exc_info=True)
+                    rim_height_mm = None
+            else:
+                logger.warning(f"Cannot compute mm measurements - depth_frame: {depth_frame is not None}, depth_processor: {self.depth_processor is not None}, rim_depth: {rim_depth}")
+            
             # Store results
             self.rim_detection_result = {
                 'contour': main_contour,
@@ -955,7 +1238,8 @@ class BackgroundSubtractionApp(QMainWindow):
                 'area_pixels': int(rim_area),
                 'bbox': (rim_x, rim_y, rim_w, rim_h),
                 'width_pixels': rim_w,
-                'height_pixels': rim_h
+                'height_pixels': rim_h,
+                'height_mm': float(rim_height_mm) if rim_height_mm is not None else None
             }
             
             # Create rim overlay
@@ -974,6 +1258,32 @@ class BackgroundSubtractionApp(QMainWindow):
                 cv2.rectangle(rim_overlay, (rim_x, rim_y), (rim_x + rim_w, rim_y + rim_h),
                             (0, 255, 255), 2)
                 
+                # Draw measurement points (top_y and bottom_y where depth is read)
+                if measurement_points is not None:
+                    top_pt = measurement_points['top']
+                    bottom_pt = measurement_points['bottom']
+                    
+                    # Draw top measurement point in GREEN
+                    cv2.circle(rim_overlay, top_pt, 8, (0, 255, 0), -1)
+                    cv2.circle(rim_overlay, top_pt, 12, (0, 255, 0), 2)
+                    cv2.putText(rim_overlay, "TOP", (top_pt[0] + 15, top_pt[1] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
+                    # Draw bottom measurement point in RED
+                    cv2.circle(rim_overlay, bottom_pt, 8, (0, 0, 255), -1)
+                    cv2.circle(rim_overlay, bottom_pt, 12, (0, 0, 255), 2)
+                    cv2.putText(rim_overlay, "BOTTOM", (bottom_pt[0] + 15, bottom_pt[1] + 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    
+                    # Draw line connecting measurement points
+                    cv2.line(rim_overlay, top_pt, bottom_pt, (255, 255, 255), 2)
+                    
+                    # Add height label if available
+                    if rim_height_mm is not None:
+                        mid_y = (top_pt[1] + bottom_pt[1]) // 2
+                        cv2.putText(rim_overlay, f"{rim_height_mm:.1f}mm", (top_pt[0] + 20, mid_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
                 # Add labels
                 cv2.putText(rim_overlay, f"Rim: {rim_w}x{rim_h}px", (rim_x, rim_y - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -991,9 +1301,16 @@ class BackgroundSubtractionApp(QMainWindow):
             info_lines = [
                 f"Rim Center (X, Y): ({rim_center_x}, {rim_center_y}) pixels",
                 f"Rim Size: {rim_w} x {rim_h} pixels",
-                f"Rim Area: {rim_area:.0f} pixels²",
-                f"Depth Filter: {'ON' if use_depth_filter else 'OFF'}"
             ]
+            
+            # Add height in mm if available
+            if rim_height_mm is not None:
+                info_lines.append(f"Rim Height (3D): {rim_height_mm:.2f} mm")
+            else:
+                info_lines.append(f"Rim Height (3D): Not available (need depth + intrinsics)")
+            
+            info_lines.append(f"Rim Area: {rim_area:.0f} pixels²")
+            info_lines.append(f"Depth Filter: {'ON' if use_depth_filter else 'OFF'}")
 
             if center_depth_mm is not None:
                 info_lines.append(f"Wheel Center Depth: {center_depth_mm:.1f} mm")
@@ -1005,10 +1322,21 @@ class BackgroundSubtractionApp(QMainWindow):
                 info_lines.append(f"\nActual Mask Depth Range:")
                 info_lines.append(f"  Min: {actual_min_depth:.1f} mm | Max: {actual_max_depth:.1f} mm")
                 info_lines.append(f"  Median: {actual_median_depth:.1f} mm")
-                info_lines.append(f"  Filter Range: {depth_min:.1f} - {depth_max:.1f} mm (±{depth_tolerance_pct*100:.0f}% of center)")
+                info_lines.append(f"  Filter Range: {depth_min:.1f} - {depth_max:.1f} mm (±{self.depth_tolerance_mm}mm absolute)")
+            
+            # Add adaptive parameters used
+            info_lines.append(f"\nAdaptive Parameters Used:")
+            info_lines.append(f"  Wheel Size: {wheel_w}x{wheel_h}px | Band: {band_height}px ({self.band_height_percent}%)")
+            if 'min_line_length' in locals():
+                info_lines.append(f"  Hough: minLen={min_line_length}px ({self.hough_min_line_percent}%), gap={max_line_gap}px ({self.hough_max_gap_percent}%)")
             
             logger.info("Rim detection complete: " + " | ".join(info_lines))
-            self.lbl_status.setText(f"Rim detected: {rim_w}x{rim_h} pixels")
+            
+            # Update status with height measurement if available
+            if rim_height_mm is not None:
+                self.lbl_status.setText(f"Rim detected: {rim_w}x{rim_h} px (height: {rim_height_mm:.2f} mm)")
+            else:
+                self.lbl_status.setText(f"Rim detected: {rim_w}x{rim_h} pixels")
             
             # logger.info(f"Rim detected at ({rim_center_x}, {rim_center_y}) with depth {rim_depth:.1f}mm")
             
