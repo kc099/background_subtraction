@@ -207,6 +207,18 @@ class BackgroundSubtractionApp(QMainWindow):
         max_dev_layout = QHBoxLayout()
         max_dev_layout.addWidget(self.slider_max_dev)
         max_dev_layout.addWidget(self.lbl_max_dev)
+
+        self.spin_depth_tol = QSpinBox()
+        self.spin_depth_tol.setRange(0, 100)
+        self.spin_depth_tol.setValue(15)
+        self.spin_depth_tol.setSuffix(" %")
+        self.spin_depth_tol.setToolTip("Depth tolerance as % of wheel center depth (increase if bottom rim is missing)")
+        
+        from PySide6.QtWidgets import QCheckBox
+        self.chk_depth_filter = QCheckBox("Use depth filtering (auto)")
+        self.chk_depth_filter.setChecked(True)
+        self.chk_depth_filter.setToolTip("Automatically narrow the mask by depth around the wheel center; uncheck to compare without depth filtering")
+        params_layout.addRow(self.chk_depth_filter)
         
         params_layout.addRow("Min Deviation:", min_dev_layout)
         params_layout.addRow("Max Deviation:", max_dev_layout)
@@ -319,6 +331,7 @@ class BackgroundSubtractionApp(QMainWindow):
         self.bg_mask = None
         self.result_overlay = None
         self.wheel_center_info = None
+        self.depth_processor = None
     
     def on_mode_changed(self):
         """Handle mode selection change"""
@@ -663,7 +676,7 @@ class BackgroundSubtractionApp(QMainWindow):
             self.lbl_status.setText("Detecting rim...")
             
             # Get parameters
-            depth_tolerance_pct = self.spin_depth_tol.value() / 100.0
+            # depth_tolerance_pct = self.spin_depth_tol.value() / 100.0
             use_depth_filter = self.chk_depth_filter.isChecked()
             
             # Get wheel center depth
@@ -741,7 +754,7 @@ class BackgroundSubtractionApp(QMainWindow):
             band_height = int(wheel_h * (1))  # % of actual wheel height
             y_band_start = max(0, wheel_center_y - band_height)
             y_band_end = min(h, wheel_center_y + band_height)
-            logger.info(f"Adaptive band: height={band_height}px ({self.band_height_percent}% of wheel {wheel_h}px)")
+            
             
             # Extract rim band only
             rim_band = depth_filtered_mask[y_band_start:y_band_end, :].copy()
